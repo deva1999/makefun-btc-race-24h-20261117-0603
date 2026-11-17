@@ -45,6 +45,14 @@ near money):
   trail only fires on a genuine reversal, never on chop.
 - MAX_HOLD_BARS = 600: exit after ten hours in a position, whatever the
   price, so no trade can sit through the whole window.
+- Re-entry guard: after a hard-stop exit, the bot does not buy again until
+  the close climbs back above the stopped-out entry close. Without it, a
+  waterfall market re-triggers the dip condition on the very next bar and
+  the bot pays the stop plus another round trip, over and over, at about
+  184 bps a cycle. The guard never fired on the dev window (both exits
+  there were take-profits) and changes nothing on any of the 40 bootstrap
+  or 24 rotated stress windows; it exists purely to bound the one failure
+  mode the dev data cannot show -- a straight waterfall with no bounce.
 
 Dev-window result for exactly these numbers (kit grade-local, not the
 simulator): recorded in the build report. Stress, for the record: over
@@ -105,6 +113,8 @@ class DipBot:
         self.entry_close = None   # close of the bar the entry was decided on
         self.peak_close = None    # highest close since the entry decision
         self.held_bars = 0        # batches since the entry decision
+        self.stop_level = None    # entry close of a hard-stop exit, if any:
+                                  # no re-entry until the close is above it
 
     def _holding(self, state):
         holding = state.positions.get(SYMBOL)
@@ -152,11 +162,16 @@ class DipBot:
             reference_high = max(self.closes[-LOOKBACK_BARS - 1:-1])
             if not _below_by(close, reference_high, DIP_BPS):
                 return []
+            if self.stop_level is not None and close <= self.stop_level:
+                # Still below the level we were stopped out at: the dip
+                # has not bounced, so buying again would re-pay the stop.
+                return []
             if state.cash < MIN_NOTIONAL:
                 return []
             self.entry_close = close
             self.peak_close = close
             self.held_bars = 0
+            self.stop_level = None  # guard served: a new entry clears it
             return [{
                 "side": "buy",
                 "symbol": SYMBOL,
@@ -172,16 +187,20 @@ class DipBot:
         if close > self.peak_close:
             self.peak_close = close
         holding = state.positions[SYMBOL]
+        exit_kind = None
         if _above_by(close, self.entry_close, TAKE_BPS):
-            pass
+            exit_kind = "take"
         elif _below_by(close, self.entry_close, STOP_BPS):
-            pass
+            exit_kind = "stop"
         elif _below_by(close, self.peak_close, TRAIL_BPS):
-            pass
+            exit_kind = "trail"
         elif self.held_bars >= MAX_HOLD_BARS:
-            pass
-        else:
+            exit_kind = "time"
+        if exit_kind is None:
             return []
+        # Only a hard stop arms the re-entry guard; a take-profit, a
+        # trailing exit, or the time cap leaves re-entry open.
+        self.stop_level = self.entry_close if exit_kind == "stop" else None
         return [{
             "side": "sell",
             "symbol": SYMBOL,
